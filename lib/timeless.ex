@@ -518,7 +518,7 @@ defmodule Timeless do
 
     case rows do
       [[type, unit, desc]] ->
-        {:ok, %{type: String.to_existing_atom(type), unit: unit, description: desc}}
+        {:ok, %{type: String.to_atom(type), unit: unit, description: desc}}
 
       [] ->
         {:ok, nil}
