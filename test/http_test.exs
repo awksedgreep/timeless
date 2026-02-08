@@ -606,6 +606,78 @@ this is not json
     assert conn.status == 403
   end
 
+  # --- Transforms ---
+
+  test "transform: divide via query_range" do
+    now = 1_700_000_000
+
+    # Write values in tenths of dBmV
+    Timeless.write(:http_test, "snr", %{"port" => "u0"}, 380.0, timestamp: now)
+    Timeless.write(:http_test, "snr", %{"port" => "u0"}, 400.0, timestamp: now + 60)
+    Timeless.flush(:http_test)
+
+    # Query with divide:10 transform
+    conn =
+      Plug.Test.conn(:get, "/api/v1/query_range?metric=snr&port=u0&from=#{now}&to=#{now + 120}&step=300&transform=divide:10")
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 200
+    result = Jason.decode!(conn.resp_body)
+    series = List.first(result["series"])
+    [_ts, val] = List.first(series["data"])
+    # avg of 380 and 400 = 390, divided by 10 = 39.0
+    assert_in_delta val, 39.0, 0.01
+  end
+
+  test "transform: multiply via query_range" do
+    now = 1_700_000_000
+
+    Timeless.write(:http_test, "ratio", %{"id" => "1"}, 0.95, timestamp: now)
+    Timeless.flush(:http_test)
+
+    conn =
+      Plug.Test.conn(:get, "/api/v1/query_range?metric=ratio&id=1&from=#{now}&to=#{now + 60}&step=300&transform=multiply:100")
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 200
+    result = Jason.decode!(conn.resp_body)
+    series = List.first(result["series"])
+    [_ts, val] = List.first(series["data"])
+    assert_in_delta val, 95.0, 0.01
+  end
+
+  test "transform: works on chart endpoint" do
+    now = 1_700_000_000
+
+    Timeless.write(:http_test, "snr_chart", %{"port" => "u0"}, 380.0, timestamp: now)
+    Timeless.write(:http_test, "snr_chart", %{"port" => "u0"}, 400.0, timestamp: now + 300)
+    Timeless.flush(:http_test)
+
+    conn =
+      Plug.Test.conn(:get, "/chart?metric=snr_chart&port=u0&from=#{now}&to=#{now + 600}&transform=divide:10")
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 200
+    assert {"content-type", "image/svg+xml; charset=utf-8"} in conn.resp_headers
+  end
+
+  test "transform: no transform when param absent" do
+    now = 1_700_000_000
+
+    Timeless.write(:http_test, "raw_val", %{"id" => "1"}, 42.0, timestamp: now)
+    Timeless.flush(:http_test)
+
+    conn =
+      Plug.Test.conn(:get, "/api/v1/query_range?metric=raw_val&id=1&from=#{now}&to=#{now + 60}&step=300")
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 200
+    result = Jason.decode!(conn.resp_body)
+    series = List.first(result["series"])
+    [_ts, val] = List.first(series["data"])
+    assert_in_delta val, 42.0, 0.01
+  end
+
   test "auth enabled: POST endpoint requires token" do
     lines = Jason.encode!(%{
       metric: %{__name__: "cpu", host: "web-1"},

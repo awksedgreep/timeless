@@ -264,13 +264,15 @@ defmodule Timeless.HTTP do
         params = conn.query_params
         step = parse_int(params["step"], 60)
         agg = parse_aggregate(params["aggregate"])
+        transform = Timeless.Transform.parse(params["transform"])
 
         {:ok, results} =
           Timeless.query_aggregate_multi(store, metric, labels,
             from: from,
             to: to,
             bucket: {step, :seconds},
-            aggregate: agg
+            aggregate: agg,
+            transform: transform
           )
 
         series =
@@ -517,13 +519,15 @@ defmodule Timeless.HTTP do
         params = conn.query_params
         step = parse_int(params["step"], 300)
         horizon = parse_duration_param(params["horizon"], 3600)
+        transform = Timeless.Transform.parse(params["transform"])
 
         {:ok, results} =
           Timeless.query_aggregate_multi(store, metric, labels,
             from: from,
             to: to,
             bucket: {step, :seconds},
-            aggregate: :avg
+            aggregate: :avg,
+            transform: transform
           )
 
         forecasts =
@@ -560,13 +564,15 @@ defmodule Timeless.HTTP do
         params = conn.query_params
         step = parse_int(params["step"], 300)
         sensitivity = parse_sensitivity(params["sensitivity"])
+        transform = Timeless.Transform.parse(params["transform"])
 
         {:ok, results} =
           Timeless.query_aggregate_multi(store, metric, labels,
             from: from,
             to: to,
             bucket: {step, :seconds},
-            aggregate: :avg
+            aggregate: :avg,
+            transform: transform
           )
 
         detections =
@@ -595,12 +601,15 @@ defmodule Timeless.HTTP do
 
     case extract_chart_params(params) do
       {:ok, metric, labels, from, to, step, agg, width, height, theme} ->
+        transform = Timeless.Transform.parse(params["transform"])
+
         {:ok, results} =
           Timeless.query_aggregate_multi(store, metric, labels,
             from: from,
             to: to,
             bucket: {step, :seconds},
-            aggregate: agg
+            aggregate: agg,
+            transform: transform
           )
 
         {:ok, annots} = Timeless.annotations(store, from, to)
@@ -788,7 +797,7 @@ defmodule Timeless.HTTP do
 
   # --- Internals ---
 
-  @reserved_params ~w(metric from to start end step aggregate width height label_key theme)
+  @reserved_params ~w(metric from to start end step aggregate width height label_key theme transform token forecast anomalies sensitivity horizon)
 
   defp extract_metric_and_labels(params) do
     case params["metric"] do

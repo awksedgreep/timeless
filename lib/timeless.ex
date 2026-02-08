@@ -205,6 +205,7 @@ defmodule Timeless do
   """
   def query_aggregate_multi(store, metric_name, label_filter \\ %{}, opts) do
     schema = get_schema(store)
+    transform = Keyword.get(opts, :transform)
     matching = find_matching_series(store, metric_name, label_filter)
 
     results =
@@ -212,7 +213,7 @@ defmodule Timeless do
       |> Task.async_stream(
         fn {series_id, labels} ->
           {:ok, buckets} = Timeless.Query.aggregate(store, series_id, Keyword.put(opts, :schema, schema))
-          %{labels: labels, data: buckets}
+          %{labels: labels, data: Timeless.Transform.apply(buckets, transform)}
         end,
         max_concurrency: System.schedulers_online(),
         ordered: false
