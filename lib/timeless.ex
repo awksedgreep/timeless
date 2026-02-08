@@ -111,10 +111,16 @@ defmodule Timeless do
     matching = find_matching_series(store, metric_name, label_filter)
 
     results =
-      Enum.map(matching, fn {series_id, labels} ->
-        {:ok, points} = Timeless.Query.raw(db, series_id, opts)
-        %{labels: labels, points: points}
-      end)
+      matching
+      |> Task.async_stream(
+        fn {series_id, labels} ->
+          {:ok, points} = Timeless.Query.raw(db, series_id, opts)
+          %{labels: labels, points: points}
+        end,
+        max_concurrency: System.schedulers_online(),
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
       |> Enum.reject(fn %{points: pts} -> pts == [] end)
 
     {:ok, results}
@@ -151,10 +157,16 @@ defmodule Timeless do
     matching = find_matching_series(store, metric_name, label_filter)
 
     results =
-      Enum.map(matching, fn {series_id, labels} ->
-        {:ok, buckets} = Timeless.Query.aggregate(db, series_id, Keyword.put(opts, :schema, schema))
-        %{labels: labels, data: buckets}
-      end)
+      matching
+      |> Task.async_stream(
+        fn {series_id, labels} ->
+          {:ok, buckets} = Timeless.Query.aggregate(db, series_id, Keyword.put(opts, :schema, schema))
+          %{labels: labels, data: buckets}
+        end,
+        max_concurrency: System.schedulers_online(),
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
       |> Enum.reject(fn %{data: d} -> d == [] end)
 
     {:ok, results}

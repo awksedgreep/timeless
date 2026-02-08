@@ -24,7 +24,8 @@ defmodule Timeless.MixProject do
       {:ezstd, "~> 1.2"},
       {:bandit, "~> 1.6"},
       {:plug, "~> 1.16"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:req, "~> 0.5", only: [:dev, :test]}
     ]
   end
 end
