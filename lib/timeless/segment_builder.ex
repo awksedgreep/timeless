@@ -14,6 +14,7 @@ defmodule Timeless.SegmentBuilder do
   defstruct [
     :segments,
     :segment_duration,
+    :pending_flush_interval,
     :compression,
     :writer,
     :readers,
@@ -25,6 +26,7 @@ defmodule Timeless.SegmentBuilder do
   ]
 
   @default_segment_duration 14_400  # 4 hours in seconds
+  @default_pending_flush_interval :timer.seconds(60)
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -86,6 +88,7 @@ defmodule Timeless.SegmentBuilder do
     shard_id = Keyword.fetch!(opts, :shard_id)
     data_dir = Keyword.fetch!(opts, :data_dir)
     segment_duration = Keyword.get(opts, :segment_duration, @default_segment_duration)
+    pending_flush_interval = Keyword.get(opts, :pending_flush_interval, @default_pending_flush_interval)
     compression = Keyword.get(opts, :compression, :zstd)
     schema = Keyword.get(opts, :schema)
 
@@ -120,6 +123,7 @@ defmodule Timeless.SegmentBuilder do
     state = %__MODULE__{
       segments: %{},
       segment_duration: segment_duration,
+      pending_flush_interval: pending_flush_interval,
       compression: compression,
       writer: writer,
       readers: readers,
@@ -132,6 +136,9 @@ defmodule Timeless.SegmentBuilder do
 
     # Periodic check for completed segments
     Process.send_after(self(), :check_segments, :timer.seconds(10))
+
+    # Periodic flush of in-progress segments to make fresh data queryable
+    Process.send_after(self(), :flush_pending, pending_flush_interval)
 
     {:ok, state}
   end
@@ -203,6 +210,20 @@ defmodule Timeless.SegmentBuilder do
 
     Process.send_after(self(), :check_segments, :timer.seconds(10))
     {:noreply, %{state | segments: pending}}
+  end
+
+  def handle_info(:flush_pending, state) do
+    # Write in-progress segments to SQLite so fresh data is queryable,
+    # but keep them in memory for continued accumulation.
+    # INSERT OR REPLACE on (series_id, start_time) naturally updates the partial segment.
+    pending = Map.values(state.segments)
+
+    if pending != [] do
+      write_segments(pending, state)
+    end
+
+    Process.send_after(self(), :flush_pending, state.pending_flush_interval)
+    {:noreply, state}
   end
 
   @impl true
