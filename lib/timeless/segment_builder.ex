@@ -3,7 +3,7 @@ defmodule Timeless.SegmentBuilder do
   Accumulates points per series and writes gorilla-compressed segments to SQLite.
 
   Points arrive in batches from the Buffer shards. The SegmentBuilder groups them
-  into time-bounded segments (default 1 hour). When a segment boundary is crossed
+  into time-bounded segments (default 4 hours). When a segment boundary is crossed
   or a flush is forced, the segment is compressed with GorillaStream + zstd and
   written to the raw_segments table.
   """
@@ -12,7 +12,7 @@ defmodule Timeless.SegmentBuilder do
 
   defstruct [:db, :segments, :segment_duration, :compression]
 
-  @default_segment_duration 3_600  # 1 hour in seconds
+  @default_segment_duration 14_400  # 4 hours in seconds
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)

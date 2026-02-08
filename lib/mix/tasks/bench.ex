@@ -9,6 +9,7 @@ defmodule Mix.Tasks.Bench do
       mix bench --tier medium      # 1K devices × 20 metrics, 90 days
       mix bench --tier stress      # 10K devices × 20 metrics, 7 days
       mix bench --devices 500 --days 30  # custom
+      mix bench --segment-duration 14400  # 4h segments (default)
 
   ## What it measures
 
@@ -35,7 +36,7 @@ defmodule Mix.Tasks.Bench do
   def run(args) do
     Mix.Task.run("app.start")
 
-    {tier_name, devices, days} = parse_args(args)
+    {tier_name, devices, days, seg_dur} = parse_args(args)
 
     metrics_count = length(@metrics)
     series_count = devices * metrics_count
@@ -44,7 +45,7 @@ defmodule Mix.Tasks.Bench do
     data_dir = "/tmp/timeless_bench_#{System.os_time(:millisecond)}"
     File.mkdir_p!(data_dir)
 
-    banner(tier_name, devices, metrics_count, days, series_count, total_points)
+    banner(tier_name, devices, metrics_count, days, series_count, total_points, seg_dur)
 
     # Schema with disabled background ticks
     schema = %Timeless.Schema{
@@ -59,14 +60,15 @@ defmodule Mix.Tasks.Bench do
         name: :bench,
         data_dir: data_dir,
         buffer_shards: System.schedulers_online(),
-        segment_duration: 3_600,
+        segment_duration: seg_dur,
         schema: schema,
         flush_threshold: 50_000,
         flush_interval: :timer.seconds(60)
       )
 
     now = System.os_time(:second)
-    start_ts = now - days * 86_400
+    # Align start_ts to segment boundary to avoid partial segments at day boundaries
+    start_ts = div(now - days * 86_400, seg_dur) * seg_dur
 
     # Pre-compute labels for fast access
     labels_for = 0..(devices - 1) |> Enum.map(&%{"host" => "device_#{&1}"}) |> List.to_tuple()
@@ -386,24 +388,26 @@ defmodule Mix.Tasks.Bench do
   defp parse_args(args) do
     {opts, _, _} =
       OptionParser.parse(args,
-        switches: [tier: :string, devices: :integer, days: :integer]
+        switches: [tier: :string, devices: :integer, days: :integer, segment_duration: :integer]
       )
 
+    seg_dur = opts[:segment_duration] || 14_400
+
     case opts[:tier] do
-      "medium" -> {:medium, 1_000, 90}
-      "stress" -> {:stress, 10_000, 7}
-      "quick" -> {:quick, 100, 90}
+      "medium" -> {:medium, 1_000, 90, seg_dur}
+      "stress" -> {:stress, 10_000, 7, seg_dur}
+      "quick" -> {:quick, 100, 90, seg_dur}
       nil ->
         devices = opts[:devices] || 100
         days = opts[:days] || 90
-        {:custom, devices, days}
-      _ -> {:quick, 100, 90}
+        {:custom, devices, days, seg_dur}
+      _ -> {:quick, 100, 90, seg_dur}
     end
   end
 
   # ── Formatting ─────────────────────────────────────────────────────
 
-  defp banner(tier, devices, metrics, days, series, total) do
+  defp banner(tier, devices, metrics, days, series, total, seg_dur) do
     IO.puts("")
     IO.puts(bar())
     IO.puts("  Timeless Benchmark — #{tier}")
@@ -412,6 +416,7 @@ defmodule Mix.Tasks.Bench do
     IO.puts("  Metrics:    #{metrics} per device")
     IO.puts("  Series:     #{fmt_int(series)}")
     IO.puts("  Duration:   #{days} days @ #{div(@interval, 60)}-min intervals")
+    IO.puts("  Segments:   #{div(seg_dur, 3600)}h (#{div(seg_dur, @interval)} pts/seg)")
     IO.puts("  Points:     #{fmt_int(total)}")
     IO.puts("  CPU:        #{System.schedulers_online()} cores")
     IO.puts(bar())
