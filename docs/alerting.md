@@ -28,6 +28,10 @@ ok → pending → firing → resolved → ok
 
 If `duration` is 0, the alert skips `pending` and fires immediately on breach.
 
+When an alert returns to `ok` from `resolved`, its state row is automatically deleted from the database. This keeps the `alert_state` table self-regulating — only active states (`pending`, `firing`, `resolved`) persist. In high-cardinality environments (thousands of devices), this prevents unbounded growth of state rows for series that are operating normally.
+
+Alert **rules** persist until explicitly deleted. If you decommission devices or rename metrics, delete the corresponding rules to avoid orphaned evaluations.
+
 ## Elixir API
 
 ### Create a rule

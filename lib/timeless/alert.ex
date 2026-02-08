@@ -216,16 +216,27 @@ defmodule Timeless.Alert do
         {_, existing} -> existing
       end
 
-    resolved_at = if new_state == "resolved", do: now, else: nil
+    # Clean up state rows that return to ok — no need to persist the default state
+    if new_state == "ok" and elem(current_state, 0) != "ok" do
+      Timeless.DB.write(
+        db,
+        "DELETE FROM alert_state WHERE rule_id = ?1 AND series_labels = ?2",
+        [rule.id, series_key]
+      )
+    else
+      if new_state != "ok" do
+        resolved_at = if new_state == "resolved", do: now, else: nil
 
-    Timeless.DB.write(
-      db,
-      """
-      INSERT OR REPLACE INTO alert_state (rule_id, series_labels, state, triggered_at, resolved_at, last_value)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-      """,
-      [rule.id, series_key, new_state, triggered_at, resolved_at, value]
-    )
+        Timeless.DB.write(
+          db,
+          """
+          INSERT OR REPLACE INTO alert_state (rule_id, series_labels, state, triggered_at, resolved_at, last_value)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+          """,
+          [rule.id, series_key, new_state, triggered_at, resolved_at, value]
+        )
+      end
+    end
 
     if should_notify && rule.webhook_url do
       deliver_webhook(rule, labels, value, new_state, now)
