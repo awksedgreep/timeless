@@ -394,10 +394,12 @@ defmodule Timeless do
     # Tier stats (aggregated from all shard DBs)
     tier_stats =
       Enum.map(schema.tiers, fn tier ->
-        {total_count, min_watermark} =
-          Enum.reduce(0..(shard_count - 1), {0, nil}, fn i, {count_acc, wm_acc} ->
+        {chunks, buckets, compressed_bytes, min_watermark} =
+          Enum.reduce(0..(shard_count - 1), {0, 0, 0, nil}, fn i, {ch_acc, bk_acc, cb_acc, wm_acc} ->
             builder = :"#{store}_builder_#{i}"
             {:ok, [[c]]} = Timeless.SegmentBuilder.read_shard(builder, "SELECT COUNT(*) FROM #{tier.table_name}")
+            {:ok, [[b]]} = Timeless.SegmentBuilder.read_shard(builder, "SELECT COALESCE(SUM(bucket_count), 0) FROM #{tier.table_name}")
+            {:ok, [[cb]]} = Timeless.SegmentBuilder.read_shard(builder, "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM #{tier.table_name}")
 
             {:ok, wm_rows} = Timeless.SegmentBuilder.read_shard(
               builder,
@@ -416,7 +418,7 @@ defmodule Timeless do
               true -> min(wm_acc, wm)
             end
 
-            {count_acc + c, merged_wm}
+            {ch_acc + c, bk_acc + b, cb_acc + cb, merged_wm}
           end)
 
         retention_label =
@@ -425,7 +427,10 @@ defmodule Timeless do
             else: "#{div(tier.retention_seconds, 86_400)}d"
 
         {tier.name, %{
-          rows: total_count,
+          rows: buckets,
+          chunks: chunks,
+          buckets: buckets,
+          compressed_bytes: compressed_bytes,
           resolution_seconds: tier.resolution_seconds,
           retention: retention_label,
           watermark: min_watermark || 0

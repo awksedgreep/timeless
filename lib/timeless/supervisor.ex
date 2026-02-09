@@ -13,7 +13,7 @@ defmodule Timeless.Supervisor do
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
     data_dir = Keyword.fetch!(opts, :data_dir)
-    shard_count = Keyword.get(opts, :buffer_shards, System.schedulers_online())
+    shard_count = Keyword.get(opts, :buffer_shards, max(div(System.schedulers_online(), 2), 2))
     flush_interval = Keyword.get(opts, :flush_interval, :timer.seconds(5))
     flush_threshold = Keyword.get(opts, :flush_threshold, 10_000)
     segment_duration = Keyword.get(opts, :segment_duration, 14_400)
