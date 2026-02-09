@@ -371,8 +371,25 @@ defmodule Timeless do
         {sc + s, tp + p, rb + b, merged_oldest, merged_newest}
       end)
 
-    {:ok, [[storage_bytes]]} =
-      Timeless.DB.read(db, "SELECT page_count * page_size FROM pragma_page_count, pragma_page_size")
+    # Sum all .db files (main + shards) for true on-disk usage
+    db_path = Timeless.DB.db_path(db)
+    data_dir = Path.dirname(db_path)
+
+    storage_bytes =
+      case File.ls(data_dir) do
+        {:ok, files} ->
+          files
+          |> Enum.filter(&String.ends_with?(&1, ".db"))
+          |> Enum.reduce(0, fn file, acc ->
+            case File.stat(Path.join(data_dir, file)) do
+              {:ok, %{size: size}} -> acc + size
+              _ -> acc
+            end
+          end)
+
+        _ ->
+          0
+      end
 
     # Tier stats (aggregated from all shard DBs)
     tier_stats =
@@ -446,7 +463,7 @@ defmodule Timeless do
       buffer_shards: shard_count,
       tiers: tier_stats,
       raw_retention: schema.raw_retention_seconds,
-      db_path: Timeless.DB.db_path(db)
+      db_path: db_path
     }
   end
 

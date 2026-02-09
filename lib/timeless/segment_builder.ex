@@ -404,7 +404,7 @@ defmodule Timeless.SegmentBuilder do
       "PRAGMA journal_mode = WAL",
       "PRAGMA synchronous = NORMAL",
       "PRAGMA cache_size = -64000",
-      "PRAGMA auto_vacuum = INCREMENTAL",
+      "PRAGMA auto_vacuum = NONE",  # freelist pages reuse naturally, no vacuum needed on shards
       "PRAGMA mmap_size = 2147483648",
       "PRAGMA wal_autocheckpoint = 10000",
       "PRAGMA temp_store = MEMORY",
