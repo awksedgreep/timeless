@@ -92,17 +92,19 @@ defmodule Timeless.Query do
       Timeless.SegmentBuilder.read_shard(
         builder,
         """
-        SELECT bucket, avg, min, max, count, sum, last
+        SELECT data
         FROM #{table}
-        WHERE series_id = ?1 AND bucket >= ?2 AND bucket < ?3
-        ORDER BY bucket
+        WHERE series_id = ?1 AND chunk_end > ?2 AND chunk_start < ?3
+        ORDER BY chunk_start
         """,
         [series_id, from, to]
       )
 
     results =
-      Enum.map(rows, fn [bucket, avg, min, max, count, sum, last] ->
-        %{bucket: bucket, avg: avg, min: min, max: max, count: count, sum: sum, last: last}
+      rows
+      |> Enum.flat_map(fn [blob] ->
+        {_aggs, buckets} = Timeless.TierChunk.decode(blob)
+        Enum.filter(buckets, fn b -> b.bucket >= from and b.bucket < to end)
       end)
 
     {:ok, results}
@@ -246,41 +248,48 @@ defmodule Timeless.Query do
   defp aggregate_from_rollup_tier(store, tier, series_id, from, to, bucket_seconds, agg_fn) do
     builder = builder_for_series(store, series_id)
 
-    {:ok, rows} =
+    {:ok, chunk_rows} =
       Timeless.SegmentBuilder.read_shard(
         builder,
         """
-        SELECT bucket, avg, min, max, count, sum, last
+        SELECT data
         FROM #{tier.table_name}
-        WHERE series_id = ?1 AND bucket >= ?2 AND bucket < ?3
-        ORDER BY bucket
+        WHERE series_id = ?1 AND chunk_end > ?2 AND chunk_start < ?3
+        ORDER BY chunk_start
         """,
         [series_id, from, to]
       )
 
+    # Decode chunks and filter to requested range
+    tier_rows =
+      chunk_rows
+      |> Enum.flat_map(fn [blob] ->
+        {_aggs, buckets} = Timeless.TierChunk.decode(blob)
+        Enum.filter(buckets, fn b -> b.bucket >= from and b.bucket < to end)
+      end)
+
     # If tier resolution matches bucket size, return directly
     if tier.resolution_seconds == bucket_seconds do
       results =
-        rows
-        |> Enum.map(fn [bucket, avg, min, max, count, sum, last] ->
+        tier_rows
+        |> Enum.map(fn row ->
           value =
             case agg_fn do
-              :avg -> avg
-              :min -> min
-              :max -> max
-              :count -> count
-              :sum -> sum
-              :last -> last
-              :first -> avg  # approximate
-              :rate -> nil   # handled below
+              :avg -> row.avg
+              :min -> row.min
+              :max -> row.max
+              :count -> row.count
+              :sum -> row.sum
+              :last -> row.last
+              :first -> row.avg
+              :rate -> nil
             end
 
-          {bucket, value, %{last: last, count: count}}
+          {row.bucket, value, %{last: row.last, count: row.count}}
         end)
 
       results =
         if agg_fn == :rate do
-          # Compute rate from last values of adjacent tier rows
           compute_tier_rate(results, tier.resolution_seconds)
         else
           Enum.map(results, fn {bucket, value, _meta} -> {bucket, value} end)
@@ -290,10 +299,7 @@ defmodule Timeless.Query do
     else
       # Re-bucket: group tier rows into larger buckets
       results =
-        rows
-        |> Enum.map(fn [bucket, avg, min, max, count, sum, last] ->
-          %{bucket: bucket, avg: avg, min: min, max: max, count: count, sum: sum, last: last}
-        end)
+        tier_rows
         |> Enum.group_by(fn row -> div(row.bucket, bucket_seconds) * bucket_seconds end)
         |> Enum.map(fn {target_bucket, group} ->
           value = reaggregate_for(agg_fn, group)
@@ -362,13 +368,23 @@ defmodule Timeless.Query do
     {:ok, rows} =
       Timeless.SegmentBuilder.read_shard(
         builder,
-        "SELECT bucket, last FROM #{table_name} WHERE series_id = ?1 ORDER BY bucket DESC LIMIT 1",
+        "SELECT data FROM #{table_name} WHERE series_id = ?1 ORDER BY chunk_start DESC LIMIT 1",
         [series_id]
       )
 
     case rows do
-      [[bucket, last]] -> {:ok, {bucket, last}}
-      [] -> {:ok, nil}
+      [[blob]] ->
+        {_aggs, buckets} = Timeless.TierChunk.decode(blob)
+
+        case buckets do
+          [] -> {:ok, nil}
+          _ ->
+            latest = Enum.max_by(buckets, & &1.bucket)
+            {:ok, {latest.bucket, latest.last}}
+        end
+
+      [] ->
+        {:ok, nil}
     end
   end
 

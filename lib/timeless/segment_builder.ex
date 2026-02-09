@@ -379,23 +379,113 @@ defmodule Timeless.SegmentBuilder do
     """, [])
 
     Enum.each(schema.tiers, fn tier ->
+      maybe_migrate_tier_table(conn, tier)
+
       execute(conn, """
       CREATE TABLE IF NOT EXISTS #{tier.table_name} (
-        series_id   INTEGER NOT NULL,
-        bucket      INTEGER NOT NULL,
-        avg         REAL,
-        min         REAL,
-        max         REAL,
-        count       INTEGER,
-        sum         REAL,
-        last        REAL,
-        PRIMARY KEY (series_id, bucket)
+        series_id    INTEGER NOT NULL,
+        chunk_start  INTEGER NOT NULL,
+        chunk_end    INTEGER NOT NULL,
+        bucket_count INTEGER NOT NULL,
+        data         BLOB NOT NULL,
+        PRIMARY KEY (series_id, chunk_start)
       ) WITHOUT ROWID
       """, [])
+
+      # Insert migrated chunks if migration happened
+      case Process.delete({:tier_migration, tier.table_name}) do
+        nil ->
+          :ok
+
+        chunks ->
+          insert_sql =
+            "INSERT OR REPLACE INTO #{tier.table_name} " <>
+              "(series_id, chunk_start, chunk_end, bucket_count, data) VALUES (?1, ?2, ?3, ?4, ?5)"
+
+          {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, insert_sql)
+
+          try do
+            Enum.each(chunks, fn {series_id, chunk_start, chunk_end, count, blob} ->
+              :ok = Exqlite.Sqlite3.bind(stmt, [series_id, chunk_start, chunk_end, count, blob])
+              :done = Exqlite.Sqlite3.step(conn, stmt)
+              :ok = Exqlite.Sqlite3.reset(stmt)
+            end)
+          after
+            Exqlite.Sqlite3.release(conn, stmt)
+          end
+      end
 
       execute(conn, "INSERT OR IGNORE INTO _watermarks (tier, last_bucket) VALUES (?1, 0)",
         [to_string(tier.name)])
     end)
+  end
+
+  defp maybe_migrate_tier_table(conn, tier) do
+    # Detect old uncompressed schema by checking for 'avg' column
+    {:ok, columns} = execute(conn, "PRAGMA table_info(#{tier.table_name})", [])
+
+    if columns != [] do
+      has_avg = Enum.any?(columns, fn row -> Enum.at(row, 1) == "avg" end)
+
+      if has_avg do
+        require Logger
+
+        Logger.info(
+          "Migrating #{tier.table_name} from row-per-bucket to compressed chunks..."
+        )
+
+        # Read all existing data
+        {:ok, rows} =
+          execute(
+            conn,
+            "SELECT series_id, bucket, avg, min, max, count, sum, last FROM #{tier.table_name} ORDER BY series_id, bucket",
+            []
+          )
+
+        # Group by series_id and chunk boundary
+        chunks =
+          rows
+          |> Enum.map(fn [sid, bucket, avg, min, max, count, sum, last] ->
+            %{
+              series_id: sid,
+              bucket: bucket,
+              avg: avg || 0.0,
+              min: min || 0.0,
+              max: max || 0.0,
+              count: count || 0,
+              sum: sum || 0.0,
+              last: last || 0.0
+            }
+          end)
+          |> Enum.group_by(& &1.series_id)
+          |> Enum.flat_map(fn {series_id, series_rows} ->
+            series_rows
+            |> Enum.group_by(fn row ->
+              div(row.bucket, tier.chunk_seconds) * tier.chunk_seconds
+            end)
+            |> Enum.map(fn {chunk_start, bucket_rows} ->
+              chunk_end = chunk_start + tier.chunk_seconds
+              buckets = Enum.map(bucket_rows, &Map.delete(&1, :series_id))
+              blob = Timeless.TierChunk.encode(buckets, tier.aggregates)
+              {series_id, chunk_start, chunk_end, length(bucket_rows), blob}
+            end)
+          end)
+
+        # Drop old table and recreate will happen via CREATE TABLE IF NOT EXISTS
+        execute(conn, "DROP TABLE #{tier.table_name}", [])
+
+        Logger.info(
+          "Migrated #{tier.table_name}: #{length(rows)} rows → #{length(chunks)} chunks"
+        )
+
+        # The new table will be created by the caller's CREATE TABLE IF NOT EXISTS.
+        # Insert migrated chunks after table creation.
+        if chunks != [] do
+          # Defer chunk insertion — store in process dict for post-creation insert
+          Process.put({:tier_migration, tier.table_name}, chunks)
+        end
+      end
+    end
   end
 
   defp configure_writer(conn) do

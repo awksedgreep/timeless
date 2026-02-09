@@ -39,7 +39,7 @@ defmodule Timeless.Schema do
 
   defmodule Tier do
     @moduledoc false
-    defstruct [:name, :resolution_seconds, :aggregates, :retention_seconds, :table_name]
+    defstruct [:name, :resolution_seconds, :aggregates, :retention_seconds, :table_name, :chunk_seconds]
   end
 
   @doc false
@@ -72,12 +72,15 @@ defmodule Timeless.Schema do
             unquote(
               Macro.escape(
                 Enum.map(tiers, fn {name, opts} ->
+                  res = Timeless.Schema.resolution_to_seconds(opts[:resolution])
+
                   %Timeless.Schema.Tier{
                     name: name,
-                    resolution_seconds: Timeless.Schema.resolution_to_seconds(opts[:resolution]),
+                    resolution_seconds: res,
                     aggregates: opts[:aggregates] || [:avg, :min, :max, :count, :sum, :last],
                     retention_seconds: Timeless.Schema.duration_to_seconds(opts[:retention]),
-                    table_name: "tier_#{name}"
+                    table_name: "tier_#{name}",
+                    chunk_seconds: Timeless.Schema.chunk_seconds(opts[:chunk], res)
                   }
                 end)
               )
@@ -129,6 +132,23 @@ defmodule Timeless.Schema do
   def resolution_to_seconds({n, :hours}), do: n * 3_600
   def resolution_to_seconds({n, :days}), do: n * 86_400
 
+  @doc """
+  Compute chunk_seconds from an explicit `:chunk` option or default based on resolution.
+
+  Defaults: hourly (≤3600s) → 24h, daily (≤86400s) → 30d, coarser → 365d.
+  """
+  def chunk_seconds(nil, resolution_seconds) do
+    cond do
+      resolution_seconds <= 3_600 -> 86_400       # 24 hours
+      resolution_seconds <= 86_400 -> 30 * 86_400  # 30 days
+      true -> 365 * 86_400                          # 1 year
+    end
+  end
+
+  def chunk_seconds(duration, _resolution_seconds) do
+    duration_to_seconds(duration)
+  end
+
   @doc "Build a default schema when none is provided."
   def default do
     %__MODULE__{
@@ -141,21 +161,24 @@ defmodule Timeless.Schema do
           resolution_seconds: 3_600,
           aggregates: [:avg, :min, :max, :count, :sum, :last],
           retention_seconds: 30 * 86_400,
-          table_name: "tier_hourly"
+          table_name: "tier_hourly",
+          chunk_seconds: 86_400
         },
         %Tier{
           name: :daily,
           resolution_seconds: 86_400,
           aggregates: [:avg, :min, :max, :count, :sum, :last],
           retention_seconds: 365 * 86_400,
-          table_name: "tier_daily"
+          table_name: "tier_daily",
+          chunk_seconds: 30 * 86_400
         },
         %Tier{
           name: :monthly,
           resolution_seconds: 30 * 86_400,
           aggregates: [:avg, :min, :max, :count, :sum],
           retention_seconds: :forever,
-          table_name: "tier_monthly"
+          table_name: "tier_monthly",
+          chunk_seconds: 365 * 86_400
         }
       ]
     }

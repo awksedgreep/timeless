@@ -202,53 +202,45 @@ defmodule Timeless.Rollup do
   end
 
   defp rollup_shard_from_tier(tier, source_tier, builder, watermark, up_to, _state) do
+    # Read compressed chunks from source tier covering [watermark, up_to)
     {:ok, rows} =
       Timeless.SegmentBuilder.read_shard(
         builder,
         """
-        SELECT series_id, bucket, avg, min, max, count, sum, last
+        SELECT series_id, data
         FROM #{source_tier.table_name}
-        WHERE bucket >= ?1 AND bucket < ?2
-        ORDER BY series_id, bucket
+        WHERE chunk_end > ?1 AND chunk_start < ?2
+        ORDER BY series_id, chunk_start
         """,
         [watermark, up_to]
       )
 
+    # Decode chunks and filter buckets to range, group by series
     grouped =
       rows
-      |> Enum.map(fn [series_id, bucket, avg, min, max, count, sum, last] ->
-        %{
-          series_id: series_id,
-          bucket: bucket,
-          avg: avg,
-          min: min,
-          max: max,
-          count: count,
-          sum: sum,
-          last: last
-        }
+      |> Enum.flat_map(fn [series_id, blob] ->
+        {_aggs, buckets} = Timeless.TierChunk.decode(blob)
+
+        buckets
+        |> Enum.filter(fn b -> b.bucket >= watermark and b.bucket < up_to end)
+        |> Enum.map(fn b -> Map.put(b, :series_id, series_id) end)
       end)
       |> Enum.group_by(& &1.series_id)
 
     Timeless.SegmentBuilder.write_transaction_shard(builder, fn conn ->
       if grouped != %{} do
-        insert_sql = "INSERT OR REPLACE INTO #{tier.table_name} (series_id, bucket, avg, min, max, count, sum, last) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-        {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, insert_sql)
-
-        try do
-          Enum.each(grouped, fn {series_id, series_rows} ->
+        Enum.each(grouped, fn {series_id, series_rows} ->
+          # Re-aggregate into target tier resolution, then group by chunk boundary
+          tier_buckets =
             series_rows
             |> Enum.group_by(fn row -> bucket_floor(row.bucket, tier.resolution_seconds) end)
-            |> Enum.each(fn {target_bucket, source_rows} ->
+            |> Enum.map(fn {target_bucket, source_rows} ->
               aggs = reaggregate(source_rows, tier.aggregates)
-              :ok = Exqlite.Sqlite3.bind(stmt, [series_id, target_bucket, aggs.avg, aggs.min, aggs.max, aggs.count, aggs.sum, aggs.last])
-              :done = Exqlite.Sqlite3.step(conn, stmt)
-              :ok = Exqlite.Sqlite3.reset(stmt)
+              Map.put(aggs, :bucket, target_bucket)
             end)
-          end)
-        after
-          Exqlite.Sqlite3.release(conn, stmt)
-        end
+
+          write_tier_chunks(conn, tier, series_id, tier_buckets)
+        end)
       end
 
       # Always advance watermark
@@ -261,24 +253,56 @@ defmodule Timeless.Rollup do
   end
 
   defp write_tier_rows(conn, tier, points_by_series) do
-    insert_sql = "INSERT OR REPLACE INTO #{tier.table_name} (series_id, bucket, avg, min, max, count, sum, last) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, insert_sql)
-
-    try do
-      Enum.each(points_by_series, fn {series_id, series_points} ->
+    Enum.each(points_by_series, fn {series_id, series_points} ->
+      tier_buckets =
         series_points
         |> Enum.group_by(fn {_sid, ts, _val} -> bucket_floor(ts, tier.resolution_seconds) end)
-        |> Enum.each(fn {bucket, bucket_points} ->
+        |> Enum.map(fn {bucket, bucket_points} ->
           values = Enum.map(bucket_points, fn {_sid, _ts, val} -> val end)
           aggs = compute_aggregates(values, tier.aggregates)
-          :ok = Exqlite.Sqlite3.bind(stmt, [series_id, bucket, aggs.avg, aggs.min, aggs.max, aggs.count, aggs.sum, aggs.last])
-          :done = Exqlite.Sqlite3.step(conn, stmt)
-          :ok = Exqlite.Sqlite3.reset(stmt)
+          Map.put(aggs, :bucket, bucket)
         end)
+
+      write_tier_chunks(conn, tier, series_id, tier_buckets)
+    end)
+  end
+
+  defp write_tier_chunks(conn, tier, series_id, tier_buckets) do
+    chunk_secs = tier.chunk_seconds || Timeless.Schema.chunk_seconds(nil, tier.resolution_seconds)
+
+    # Group buckets by chunk boundary
+    chunks =
+      Enum.group_by(tier_buckets, fn b ->
+        div(b.bucket, chunk_secs) * chunk_secs
       end)
-    after
-      Exqlite.Sqlite3.release(conn, stmt)
-    end
+
+    Enum.each(chunks, fn {chunk_start, new_buckets} ->
+      chunk_end = chunk_start + chunk_secs
+
+      # Read existing chunk (read-modify-write)
+      {:ok, existing_rows} =
+        Timeless.SegmentBuilder.execute(
+          conn,
+          "SELECT data FROM #{tier.table_name} WHERE series_id = ?1 AND chunk_start = ?2",
+          [series_id, chunk_start]
+        )
+
+      existing_blob =
+        case existing_rows do
+          [[blob]] -> blob
+          [] -> nil
+        end
+
+      # Merge new buckets into existing (or create new)
+      merged_blob = Timeless.TierChunk.merge(existing_blob, new_buckets, tier.aggregates)
+      bucket_count = Timeless.TierChunk.bucket_count(merged_blob)
+
+      Timeless.SegmentBuilder.execute(
+        conn,
+        "INSERT OR REPLACE INTO #{tier.table_name} (series_id, chunk_start, chunk_end, bucket_count, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+        [series_id, chunk_start, chunk_end, bucket_count, merged_blob]
+      )
+    end)
   end
 
   # --- Late-arrival catch-up ---

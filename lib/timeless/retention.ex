@@ -72,7 +72,7 @@ defmodule Timeless.Retention do
       end
     end
 
-    # 2. Drop expired rollup rows per tier (from all shard DBs)
+    # 2. Drop expired compressed tier chunks (fully expired only)
     Enum.each(state.schema.tiers, fn tier ->
       if tier.retention_seconds != :forever do
         cutoff = now - tier.retention_seconds
@@ -81,7 +81,7 @@ defmodule Timeless.Retention do
           builder = :"#{state.store}_builder_#{i}"
           Timeless.SegmentBuilder.delete_shard(
             builder,
-            "DELETE FROM #{tier.table_name} WHERE bucket < ?1",
+            "DELETE FROM #{tier.table_name} WHERE chunk_end < ?1",
             [cutoff]
           )
         end
