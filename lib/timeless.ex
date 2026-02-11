@@ -22,6 +22,9 @@ defmodule Timeless do
       )
   """
 
+  # Batch sizes above this threshold use parallel resolution + shard writes
+  @parallel_batch_threshold 1_000
+
   @doc "Start a Timeless instance as part of a supervision tree."
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -103,10 +106,7 @@ defmodule Timeless do
       {sid, value, ts} ->
         {sid, ts, value}
     end)
-    |> Enum.group_by(fn {sid, _, _} -> rem(abs(sid), shard_count) end)
-    |> Enum.each(fn {shard_idx, points} ->
-      Timeless.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
-    end)
+    |> group_and_write_shards(store, shard_count)
   end
 
   @doc """
@@ -119,21 +119,46 @@ defmodule Timeless do
     registry = :"#{store}_registry"
     shard_count = buffer_shard_count(store)
 
-    # Resolve all series IDs and group by shard in one pass
-    entries
-    |> Enum.map(fn
-      {metric_name, labels, value} ->
-        sid = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
-        {sid, System.os_time(:second), value}
+    if length(entries) >= @parallel_batch_threshold do
+      # Parallel: each Task resolves its chunk AND writes to shards — no sync barrier
+      chunk_size = max(div(length(entries), System.schedulers_online()), 1)
 
-      {metric_name, labels, value, ts} ->
-        sid = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
-        {sid, ts, value}
-    end)
-    |> Enum.group_by(fn {sid, _, _} -> rem(abs(sid), shard_count) end)
-    |> Enum.each(fn {shard_idx, points} ->
-      Timeless.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
-    end)
+      entries
+      |> Enum.chunk_every(chunk_size)
+      |> Enum.map(fn chunk ->
+        Task.async(fn ->
+          chunk
+          |> Enum.map(fn
+            {metric_name, labels, value} ->
+              sid = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+              {sid, System.os_time(:second), value}
+
+            {metric_name, labels, value, ts} ->
+              sid = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+              {sid, ts, value}
+          end)
+          |> Enum.group_by(fn {sid, _, _} -> rem(abs(sid), shard_count) end)
+          |> Enum.each(fn {shard_idx, points} ->
+            Timeless.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+          end)
+        end)
+      end)
+      |> Task.await_many()
+
+      :ok
+    else
+      entries
+      |> Enum.map(fn
+        {metric_name, labels, value} ->
+          sid = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+          {sid, System.os_time(:second), value}
+
+        {metric_name, labels, value, ts} ->
+          sid = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+          {sid, ts, value}
+      end)
+      |> group_and_write_shards(store, shard_count)
+    end
   end
 
   @doc """
@@ -915,6 +940,26 @@ defmodule Timeless do
 
   defp buffer_shard_count(store) do
     :persistent_term.get({Timeless, store, :shard_count})
+  end
+
+  defp group_and_write_shards(resolved, store, shard_count) do
+    by_shard = Enum.group_by(resolved, fn {sid, _, _} -> rem(abs(sid), shard_count) end)
+
+    if map_size(by_shard) > 1 do
+      by_shard
+      |> Enum.map(fn {shard_idx, points} ->
+        Task.async(fn ->
+          Timeless.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+        end)
+      end)
+      |> Task.await_many()
+    else
+      Enum.each(by_shard, fn {shard_idx, points} ->
+        Timeless.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+      end)
+    end
+
+    :ok
   end
 
   defp find_matching_series(store, metric_name, label_filter) do

@@ -132,19 +132,28 @@ defmodule Mix.Tasks.Bench do
     for day <- 0..(days - 1) do
       day_start = start_ts + day * 86_400
 
-      # Write one day of data
+      # Write one day of data — concurrent interval writers
+      writers = min(System.schedulers_online(), @intervals_per_day)
+
       {write_us, _} =
         :timer.tc(fn ->
-          for interval <- 0..(@intervals_per_day - 1) do
-            ts = day_start + interval * @interval
+          0..(@intervals_per_day - 1)
+          |> Enum.chunk_every(max(div(@intervals_per_day, writers), 1))
+          |> Enum.map(fn intervals ->
+            Task.async(fn ->
+              Enum.each(intervals, fn interval ->
+                ts = day_start + interval * @interval
 
-            entries =
-              for dev <- 0..(devices - 1), metric <- @metrics do
-                {metric, elem(labels_for, dev), gen(metric, ts, dev, start_ts), ts}
-              end
+                entries =
+                  for dev <- 0..(devices - 1), metric <- @metrics do
+                    {metric, elem(labels_for, dev), gen(metric, ts, dev, start_ts), ts}
+                  end
 
-            Timeless.write_batch(:bench, entries)
-          end
+                Timeless.write_batch(:bench, entries)
+              end)
+            end)
+          end)
+          |> Task.await_many(:infinity)
         end)
 
       :counters.add(total_write_us, 1, write_us)
@@ -382,6 +391,49 @@ defmodule Mix.Tasks.Bench do
       end)
 
     total = batch_iters * length(resolved_entries_per)
+    rate = trunc(total / (us / 1_000_000))
+    IO.puts("    #{fmt_int(total)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} writes/sec]")
+
+    # Concurrent batch writes (multiple callers, simulates real HTTP traffic)
+    concurrent_writers = System.schedulers_online()
+    IO.puts("")
+    IO.puts("  Concurrent batch write (#{concurrent_writers} writers × #{devices} devices × #{length(@metrics)} metrics):")
+
+    {us, _} =
+      :timer.tc(fn ->
+        1..concurrent_writers
+        |> Enum.map(fn _ ->
+          Task.async(fn ->
+            for _ <- 1..batch_iters do
+              Timeless.write_batch(:bench, entries_per)
+            end
+          end)
+        end)
+        |> Task.await_many(:infinity)
+      end)
+
+    total = concurrent_writers * batch_iters * length(entries_per)
+    rate = trunc(total / (us / 1_000_000))
+    IO.puts("    #{fmt_int(total)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} writes/sec]")
+
+    # Concurrent batch writes, pre-resolved
+    IO.puts("")
+    IO.puts("  Concurrent batch write, pre-resolved (#{concurrent_writers} writers):")
+
+    {us, _} =
+      :timer.tc(fn ->
+        1..concurrent_writers
+        |> Enum.map(fn _ ->
+          Task.async(fn ->
+            for _ <- 1..batch_iters do
+              Timeless.write_batch_resolved(:bench, resolved_entries_per)
+            end
+          end)
+        end)
+        |> Task.await_many(:infinity)
+      end)
+
+    total = concurrent_writers * batch_iters * length(resolved_entries_per)
     rate = trunc(total / (us / 1_000_000))
     IO.puts("    #{fmt_int(total)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} writes/sec]")
   end
